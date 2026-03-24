@@ -1,0 +1,12 @@
+venv/
+build/
+dist/
+__pycache__/
+*.pyc
+*.pyo
+ffpass*
+*.spec.bak
+.DS_Store
+Thumbs.db
+.claude/
+FuckYouDiscord.spec
