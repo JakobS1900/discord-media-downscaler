@@ -310,6 +310,32 @@ def _compress_gif(path, limit_bytes, progress_cb, stop_event):
 
 # ─── Video ────────────────────────────────────────────────────────────────────
 
+# Resolution ladder: (vf_scale_arg, human_label)
+# None means original resolution. Framerate-reduced steps are used last-resort.
+_RESOLUTION_STEPS = [
+    (None,        'original size'),
+    ('1280:-2',   '1280px wide'),
+    ('854:-2',    '854px wide'),
+    ('640:-2',    '640px wide'),
+    ('480:-2',    '480px wide'),
+    ('360:-2',    '360px wide'),
+    ('240:-2',    '240px wide'),
+    ('240:-2,fps=15', '240px @ 15fps'),
+    ('240:-2,fps=10', '240px @ 10fps'),
+]
+
+
+def _pick_audio_kbps(total_budget_kbps: int) -> tuple[int, bool]:
+    """Return (audio_kbps, force_mono) given the total budget in kbps."""
+    if total_budget_kbps >= 160:
+        return 128, False
+    if total_budget_kbps >= 80:
+        return 64, False
+    if total_budget_kbps >= 40:
+        return 32, False
+    return 16, True   # very tight budget — mono helps halve audio size
+
+
 def _compress_video(path, limit_bytes, progress_cb, stop_event):
     if os.path.getsize(path) <= limit_bytes:
         out = get_output_path(path, '.mp4')
@@ -325,55 +351,111 @@ def _compress_video(path, limit_bytes, progress_cb, stop_event):
     if not duration or duration < 0.1:
         return _video_fallback(path, limit_bytes, progress_cb, stop_event, has_audio)
 
-    # Try original resolution, then scaled-down fallbacks
-    for scale_filter in [None, '1280:-2', '854:-2', '640:-2']:
+    best_effort_path: str | None = None
+    best_effort_size: int = 2 ** 62
+
+    steps = _RESOLUTION_STEPS[:]
+    # Final pass: try without audio if we still can't fit
+    if has_audio:
+        steps.append(('240:-2,fps=10', '240px @ 10fps (no audio)'))
+
+    for step_idx, (scale_filter, label) in enumerate(steps):
         if stop_event and stop_event.is_set():
             raise InterruptedError('Cancelled by user')
-        result = _video_twopass(
-            path, limit_bytes, duration, has_audio,
-            scale_filter, progress_cb, stop_event
-        )
-        if result:
-            return result
 
-    # Last resort: return whatever we have
-    return get_output_path(path, '.mp4')
+        # Strip audio only on the very last appended step
+        strip_audio = (not has_audio) or (step_idx == len(steps) - 1 and has_audio)
+
+        if progress_cb and step_idx > 0:
+            progress_cb(
+                int(step_idx / len(steps) * 90),
+                f'Still too large — trying {label}...',
+            )
+
+        winner, effort, effort_size = _video_twopass(
+            path, limit_bytes, duration,
+            has_audio and not strip_audio,
+            scale_filter, label, progress_cb, stop_event,
+            step_idx, len(steps),
+        )
+
+        if winner:
+            return winner   # hit the target — done
+
+        if effort and effort_size < best_effort_size:
+            best_effort_path = effort
+            best_effort_size = effort_size
+
+    # Nothing reached the limit — return smallest result we achieved
+    if progress_cb:
+        mb = best_effort_size / 1024 / 1024
+        progress_cb(99, f'Best effort: {mb:.1f} MB (target not fully reached)')
+    return best_effort_path or get_output_path(path, '.mp4')
 
 
 def _video_twopass(path, limit_bytes, duration, has_audio,
-                   scale_filter, progress_cb, stop_event):
+                   scale_filter, res_label, progress_cb, stop_event,
+                   step_idx, total_steps):
     """
-    Two-pass H.264 encoding with bitrate targeting.
-    Binary-searches the target bitrate to fit within limit_bytes.
+    Two-pass H.264 encoding targeting limit_bytes.
+    Returns (winner_path, best_effort_path, best_effort_size).
+    winner_path is set only when a result fits within limit_bytes.
+    best_effort_path is the smallest file produced regardless.
     """
     import tempfile, os as _os
 
     out = get_output_path(path, '.mp4')
-    res_label = f' @{scale_filter.split(":")[0]}px' if scale_filter else ''
-    vf_args = ['-vf', f'scale={scale_filter}'] if scale_filter else []
-    audio_kbps = 128 if has_audio else 0
-    audio_args = ['-c:a', 'aac', '-b:a', '128k'] if has_audio else ['-an']
 
-    # Calculate initial target bitrate from limit
-    total_kbps = int((limit_bytes * 8) / duration / 1000 * 0.95)
-    video_kbps = max(50, total_kbps - audio_kbps)
+    # Build video filter — handle fps= suffix in scale_filter
+    if scale_filter and 'fps=' in scale_filter:
+        vf_args = ['-vf', scale_filter]
+    elif scale_filter:
+        vf_args = ['-vf', f'scale={scale_filter}']
+    else:
+        vf_args = []
+
+    # Dynamic audio bitrate based on total budget
+    total_budget = int((limit_bytes * 8) / duration / 1000 * 0.95)
+    audio_kbps, audio_mono = _pick_audio_kbps(total_budget) if has_audio else (0, False)
+    if has_audio:
+        audio_ch = ['-ac', '1'] if audio_mono else []
+        audio_args = ['-c:a', 'aac', '-b:a', f'{audio_kbps}k', *audio_ch]
+    else:
+        audio_args = ['-an']
+
+    # Initial video target: total budget minus audio share
+    video_kbps = max(8, total_budget - audio_kbps)
 
     tmp_dir = tempfile.mkdtemp(prefix='dmd_')
     passlog = _os.path.join(tmp_dir, 'ffpass')
 
-    best: str | None = None
+    winner: str | None = None
+    effort_path: str | None = None
+    effort_size: int = 2 ** 62
 
     try:
-        # Try at target, then back off 12% each time if output overshoots
-        for attempt, factor in enumerate([1.0, 0.88, 0.75, 0.62]):
+        # 5 backoff attempts: 100% → 85% → 70% → 55% → 40% of calculated bitrate
+        backoff_factors = [1.0, 0.85, 0.70, 0.55, 0.40]
+        n_attempts = len(backoff_factors)
+
+        for attempt, factor in enumerate(backoff_factors):
             if stop_event and stop_event.is_set():
                 raise InterruptedError('Cancelled by user')
 
-            kbps = max(50, int(video_kbps * factor))
+            kbps = max(8, int(video_kbps * factor))
 
-            pct_base = int(attempt / 4 * 80)
+            # Progress within this resolution step
+            step_frac = step_idx / total_steps
+            next_frac = (step_idx + 1) / total_steps
+            pct_base = int((step_frac + attempt / n_attempts * (next_frac - step_frac)) * 90)
+
+            scan_msg = (
+                f'Scanning video ({res_label})...'
+                if attempt == 0
+                else f'Adjusting — re-scanning ({res_label})...'
+            )
             if progress_cb:
-                progress_cb(pct_base, f'Video{res_label}: {kbps} kbps pass 1/2')
+                progress_cb(pct_base, scan_msg)
 
             # Clean passlog before each attempt
             for f in Path(tmp_dir).glob('ffpass*'):
@@ -394,8 +476,14 @@ def _video_twopass(path, limit_bytes, duration, has_audio,
             if rc1 != 0:
                 continue
 
+            enc_msg = (
+                f'Encoding at {kbps} kbps ({res_label})...'
+                if attempt == 0
+                else f'Re-encoding at {kbps} kbps ({res_label})...'
+            )
             if progress_cb:
-                progress_cb(pct_base + 10, f'Video{res_label}: {kbps} kbps pass 2/2')
+                progress_cb(pct_base + max(1, int((next_frac - step_frac) * 90 / n_attempts / 2)),
+                            enc_msg)
 
             rc2, _ = _run([
                 '-y', '-i', path,
@@ -418,8 +506,14 @@ def _video_twopass(path, limit_bytes, duration, has_audio,
                 continue
 
             size = _os.path.getsize(out)
+
+            # Track the best (smallest) result regardless of limit
+            if size < effort_size:
+                effort_path = out
+                effort_size = size
+
             if size <= limit_bytes:
-                best = out
+                winner = out
                 break   # First fit is good enough — two-pass already optimises quality
 
     finally:
@@ -433,9 +527,7 @@ def _video_twopass(path, limit_bytes, duration, has_audio,
         except OSError:
             pass
 
-    if progress_cb and best:
-        progress_cb(100, f'Video compressed{res_label}')
-    return best
+    return winner, effort_path, effort_size
 
 
 def _video_fallback(path, limit_bytes, progress_cb, stop_event, has_audio):

@@ -260,6 +260,7 @@ class App(tk.Tk):
         self._last_out_dir: str | None = None
         self._compressing = False
         self._auto_open   = tk.BooleanVar(value=True)
+        self._current_limit: int = 10 * 1024 * 1024  # updated when compression starts
 
         # Animation state
         self._anim_frame  = 0
@@ -340,6 +341,7 @@ class App(tk.Tk):
         self._tree.tag_configure('done',  foreground=GREEN)
         self._tree.tag_configure('error', foreground=RED)
         self._tree.tag_configure('busy',  foreground=YELLOW)
+        self._tree.tag_configure('warn',  foreground='#f0a030')
 
         vsb = ttk.Scrollbar(tree_frame, orient='vertical',
                             command=self._tree.yview,
@@ -533,6 +535,7 @@ class App(tk.Tk):
             return
 
         limit = TIER_LIMITS[self._tier.get()]
+        self._current_limit = limit
         self._stop.clear()
         self._compressing = True
         self._progbar.set_progress(0)
@@ -588,12 +591,13 @@ class App(tk.Tk):
                 out  = compressor.compress_file(path, limit, _cb, self._stop)
                 size = os.path.getsize(out) if os.path.exists(out) else 0
                 self._last_out_dir = str(Path(out).parent)
-                self._q.put(('item_done', path, out, size, None))
+                met_limit = size <= limit
+                self._q.put(('item_done', path, out, size, None, met_limit))
             except InterruptedError:
-                self._q.put(('item_done', path, None, 0, 'Cancelled'))
+                self._q.put(('item_done', path, None, 0, 'Cancelled', False))
                 break
             except Exception as exc:
-                self._q.put(('item_done', path, None, 0, str(exc)[:40]))
+                self._q.put(('item_done', path, None, 0, str(exc)[:40], False))
 
         self._q.put(('all_done',))
 
@@ -624,7 +628,7 @@ class App(tk.Tk):
                                 tags=(tag,))
 
         elif kind == 'item_done':
-            _, path, out_path, out_size, error = msg
+            _, path, out_path, out_size, error, met_limit = msg
             if not self._tree.exists(path):
                 return
             name = Path(path).name
@@ -633,7 +637,8 @@ class App(tk.Tk):
                 self._tree.item(path,
                                 values=(name, fmt_size(orig), f'✗ {error}'),
                                 tags=('error',))
-            else:
+                self._status[path] = 'error'
+            elif met_limit:
                 savings = int((1 - out_size / orig) * 100) if orig > 0 else 0
                 status_text = f'Done ✓ -{savings}%' if savings > 0 else 'Done ✓ (no change)'
                 self._tree.item(path,
@@ -641,7 +646,16 @@ class App(tk.Tk):
                                         f'{fmt_size(orig)} → {fmt_size(out_size)}',
                                         status_text),
                                 tags=('done',))
-            self._status[path] = 'error' if error else 'done'
+                self._status[path] = 'done'
+            else:
+                limit_str = fmt_size(self._current_limit)
+                status_text = f'⚠ Best effort: {fmt_size(out_size)} (target {limit_str})'
+                self._tree.item(path,
+                                values=(name,
+                                        f'{fmt_size(orig)} → {fmt_size(out_size)}',
+                                        status_text),
+                                tags=('warn',))
+                self._status[path] = 'warn'
 
         elif kind == 'global_status':
             self._set_status(msg[1])
@@ -654,9 +668,11 @@ class App(tk.Tk):
                                        fg=FG_DIM, activeforeground=FG_DIM)
             self._tree.tag_configure('busy', foreground=YELLOW)
             done  = sum(1 for v in self._status.values() if v == 'done')
+            warn  = sum(1 for v in self._status.values() if v == 'warn')
             error = sum(1 for v in self._status.values() if v == 'error')
             parts: list[str] = []
             if done:  parts.append(f'{done} compressed')
+            if warn:  parts.append(f'{warn} best effort (see ⚠ items)')
             if error: parts.append(f'{error} failed')
             self._set_status(
                 (', '.join(parts) or 'Done')
