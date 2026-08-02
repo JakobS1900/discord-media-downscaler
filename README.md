@@ -1,20 +1,21 @@
 # Discord Media Downscaler
 
-Compress images, video, and audio to fit Discord's file size limits — with minimal quality loss. Supports all Discord tiers (10 MB, 25 MB Free, 50 MB Nitro Basic, 500 MB Nitro).
+Compress images, video, and audio to fit Discord's file size limit with as
+little quality loss as the limit allows. Supports every tier: 10 MB, 25 MB
+free, 50 MB Nitro Basic, 500 MB Nitro.
 
-## Features
+Drop a file in, pick your limit, get a file back that fits. No account, no
+upload, no server. Everything runs on your machine.
 
-- **Images** — JPEG, PNG, WebP, GIF (including animated): binary-search quality/scale to hit target size
-- **Video** — MP4, MOV, WebM, MKV, AVI: two-pass H.264 bitrate targeting; progressive resolution fallback
-- **Audio** — MP3, OGG, WAV, FLAC, AAC, M4A: bitrate binary-search; lossless sources convert to Opus OGG
-- Animated progress bar, per-file savings percentage, auto-open output folder
-- Self-contained binaries — no installation required on Windows, Linux, or macOS
+**Platforms:** Windows, Linux, macOS. Pre-built binaries, no Python install
+needed.
+**Android port:** [discord-media-downscaler-android](https://github.com/JakobS1900/discord-media-downscaler-android)
 
 ---
 
-## Download (pre-built binaries)
+## Download
 
-Go to the [Releases](../../releases/latest) page and grab the binary for your platform:
+Grab a binary from [Releases](../../releases/latest):
 
 | Platform | File |
 |---|---|
@@ -22,86 +23,123 @@ Go to the [Releases](../../releases/latest) page and grab the binary for your pl
 | Linux | `DiscordMediaDownscaler-linux` |
 | macOS (Apple Silicon) | `DiscordMediaDownscaler-macos` |
 
-### Windows
-Double-click `DiscordMediaDownscaler-windows.exe`. That's it.
+**Windows:** double-click it.
 
-### Linux
+**Linux:**
 ```bash
 chmod +x DiscordMediaDownscaler-linux
 ./DiscordMediaDownscaler-linux
 ```
 
-### macOS — Gatekeeper notice
-The binary is unsigned, so macOS will block it on first launch. Two options:
-
-**Option A — Right-click method (easiest):**
-1. Right-click (or Control-click) `DiscordMediaDownscaler-macos` in Finder
-2. Select **Open**
-3. Click **Open** in the dialog
-
-**Option B — Terminal:**
+**macOS:** the binary is unsigned, so Gatekeeper blocks it the first time.
+Either right-click the file in Finder, choose Open, then Open again in the
+dialog, or clear the quarantine flag from a terminal:
 ```bash
 xattr -d com.apple.quarantine DiscordMediaDownscaler-macos
 chmod +x DiscordMediaDownscaler-macos
 ./DiscordMediaDownscaler-macos
 ```
+One-time step. It launches normally after that.
 
-After this one-time step, you can launch it normally.
+---
+
+## How the compression actually works
+
+The interesting part is not calling FFmpeg. It is hitting a hard byte ceiling
+without throwing away more quality than you have to, on media you have never
+seen before.
+
+**Images: binary search on quality, not a fixed guess.**
+JPEG and WebP quality has a non-linear relationship to output size, and it
+differs per image, so a fixed quality setting either overshoots the limit or
+wastes half of it. Instead the encoder binary-searches the quality value, at
+most 14 probes, and stops early once a result lands within 85% of the limit.
+That last condition matters: without it the search keeps going for a result
+that is a rounding error smaller, at the cost of visible quality.
+
+When quality bottoms out at 1 and the file is still too big, dimensions halve
+and the search restarts. PNG tries lossless first, then falls back to WebP if
+the image has alpha, or JPEG if it does not.
+
+**Video: two-pass H.264 down a resolution ladder.**
+The target bitrate is computed from the actual limit and the actual duration
+rather than guessed. Audio takes a share of that budget scaled to how tight
+the total is: 128 kbps when there is room, dropping to 16 kbps mono when there
+is not, because at a very tight budget every kbps spent on audio is taken
+directly from the picture.
+
+Each resolution step gets five encoding attempts backing off to 40% of the
+calculated bitrate, because two-pass rate control undershoots on some content
+and overshoots on others. If a step cannot fit, the ladder drops a rung:
+original, 1280, 854, 640, 480, 360, 240, then 240 at reduced framerate, then
+finally 240 with audio stripped. It stops at the first result that fits,
+since two-pass has already optimized quality at that bitrate.
+
+If nothing on the ladder fits, it returns the smallest file it produced rather
+than failing, and says so.
+
+**Audio: bitrate search, stereo before mono.**
+Same binary search, on bitrate, quantized to 8 kbps steps. Stereo is tried
+across the whole range first, and mono only if stereo cannot fit, because
+halving the channels is a bigger perceptual hit than a moderate bitrate drop.
+Lossless sources (WAV, FLAC) convert to Opus, which is the right codec for
+low bitrates.
+
+**Throughout:** metadata is stripped from every output (`-map_metadata -1`,
+and a clean pixel copy for images), so location and camera data from your
+phone do not travel with the file. Video gets `+faststart` so it plays before
+it has finished downloading. Long encodes are cancellable, and cancelling
+terminates the FFmpeg process rather than orphaning it.
+
+| Media | Method |
+|---|---|
+| JPEG | Binary-search Pillow quality 1-95, then halve dimensions |
+| PNG | Lossless first, then WebP (alpha) or JPEG (no alpha) |
+| WebP | Binary-search quality |
+| Animated GIF | FFmpeg palettegen and paletteuse, then a width ladder |
+| Video | Two-pass libx264 with bitrate backoff and a resolution ladder |
+| Audio (lossy) | Binary-search bitrate, MP3 or Vorbis |
+| Audio (lossless) | Opus, stereo then mono |
 
 ---
 
 ## Run from source
 
-Requires **Python 3.9+**. On Linux, also requires `python3-tk` (`sudo apt install python3-tk`).
+Python 3.9 or newer. On Linux you also need `python3-tk`
+(`sudo apt install python3-tk`).
 
 ```bash
-# 1. Clone
 git clone https://github.com/JakobS1900/discord-media-downscaler.git
 cd discord-media-downscaler
 
-# 2. One-click setup (creates venv, installs deps)
-bash install.sh          # Linux / macOS
+bash install.sh          # Linux and macOS: creates a venv, installs deps
+bash run.sh
 
-# Windows (in Command Prompt):
+# Windows:
 # python -m venv venv && venv\Scripts\pip install -r requirements.txt
-
-# 3. Run
-bash run.sh              # Linux / macOS terminal
-# macOS Finder: double-click run.command (auto-installs on first launch)
-# Windows: python main.py
+# python main.py
 ```
 
-## Build the binary yourself
+## Build your own binary
 
 ```bash
-bash build.sh            # Linux / macOS  →  dist/DiscordMediaDownscaler
-build.bat                # Windows        →  dist/DiscordMediaDownscaler.exe
+bash build.sh            # Linux and macOS -> dist/DiscordMediaDownscaler
+build.bat                # Windows         -> dist/DiscordMediaDownscaler.exe
 ```
 
----
-
-## How it works
-
-| Media | Method |
-|---|---|
-| JPEG | Binary-search Pillow quality (1–95) |
-| PNG | Max lossless compression; falls back to WebP (alpha) or JPEG (no alpha) |
-| WebP | Binary-search quality |
-| Animated GIF | FFmpeg palettegen + paletteuse; scale-down fallback |
-| Video | Two-pass H.264 (libx264) bitrate targeting; resolution fallback (1280→854→640px) |
-| Audio (lossy) | Binary-search bitrate (MP3/Vorbis) |
-| Audio (WAV/FLAC) | Convert to Opus OGG; stereo → mono fallback for tight limits |
+Releases are built in CI. See
+[`.github/workflows/build.yml`](.github/workflows/build.yml) for the matrix
+that produces all three platform binaries.
 
 ---
 
 ## Dependencies
 
-- [Pillow](https://pillow.readthedocs.io/) — image processing
-- [imageio-ffmpeg](https://github.com/imageio/imageio-ffmpeg) — self-contained FFmpeg binary
-- [PyInstaller](https://pyinstaller.org/) — single-binary packaging (build only)
-
----
+- [Pillow](https://pillow.readthedocs.io/) for image processing
+- [imageio-ffmpeg](https://github.com/imageio/imageio-ffmpeg) which ships a
+  self-contained FFmpeg, so users do not have to install it
+- [PyInstaller](https://pyinstaller.org/) for single-binary packaging, build only
 
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).
